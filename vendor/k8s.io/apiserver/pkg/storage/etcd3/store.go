@@ -23,7 +23,6 @@ import (
 	"fmt"
 	"path"
 	"reflect"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -38,8 +37,6 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/conversion"
-	"k8s.io/apimachinery/pkg/fields"
-	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/watch"
@@ -203,9 +200,7 @@ func New(c *kubernetes.Client, compactor Compactor, codec runtime.Codec, newFunc
 	w.getCurrentStorageRV = func(ctx context.Context) (uint64, error) {
 		return s.GetCurrentResourceVersion(ctx)
 	}
-	if utilfeature.DefaultFeatureGate.Enabled(features.ConsistentListFromCache) || utilfeature.DefaultFeatureGate.Enabled(features.WatchList) {
-		etcdfeature.DefaultFeatureSupportChecker.CheckClient(c.Ctx(), c, storage.RequestWatchProgress)
-	}
+	etcdfeature.DefaultFeatureSupportChecker.CheckClient(c.Ctx(), c, storage.RequestWatchProgress)
 	return s, nil
 }
 
@@ -351,22 +346,22 @@ func (s *store) Delete(
 		return fmt.Errorf("unable to convert output object to pointer: %v", err)
 	}
 
-	skipTransformDecode := false
+	expectTransformOrDecodeError := false
 	if utilfeature.DefaultFeatureGate.Enabled(features.AllowUnsafeMalformedObjectDeletion) {
-		skipTransformDecode = opts.IgnoreStoreReadError
+		expectTransformOrDecodeError = opts.ExpectTransformOrDecodeError
 	}
-	return s.conditionalDelete(ctx, preparedKey, out, v, preconditions, validateDeletion, cachedExistingObject, skipTransformDecode)
+	return s.conditionalDelete(ctx, preparedKey, out, v, preconditions, validateDeletion, cachedExistingObject, expectTransformOrDecodeError)
 }
 
 func (s *store) conditionalDelete(
 	ctx context.Context, key string, out runtime.Object, v reflect.Value, preconditions *storage.Preconditions,
-	validateDeletion storage.ValidateObjectFunc, cachedExistingObject runtime.Object, skipTransformDecode bool) error {
-	getCurrentState := s.getCurrentState(ctx, key, v, false, skipTransformDecode)
+	validateDeletion storage.ValidateObjectFunc, cachedExistingObject runtime.Object, expectTransformOrDecodeError bool) error {
+	getCurrentState := s.getCurrentState(ctx, key, v, false, expectTransformOrDecodeError)
 
 	var origState *objState
 	var err error
 	var origStateIsCurrent bool
-	if cachedExistingObject != nil {
+	if cachedExistingObject != nil && !expectTransformOrDecodeError {
 		origState, err = s.getStateFromObject(cachedExistingObject)
 	} else {
 		origState, err = getCurrentState()
@@ -440,7 +435,7 @@ func (s *store) conditionalDelete(
 		}
 		if !txnResp.Succeeded {
 			klog.V(4).Infof("deletion of %s failed because of a conflict, going to retry", key)
-			origState, err = s.getState(ctx, txnResp.KV, key, v, false, skipTransformDecode)
+			origState, err = s.getState(ctx, txnResp.KV, key, v, false, expectTransformOrDecodeError)
 			if err != nil {
 				return err
 			}
@@ -448,7 +443,7 @@ func (s *store) conditionalDelete(
 			continue
 		}
 
-		if !skipTransformDecode {
+		if !expectTransformOrDecodeError {
 			err = s.decoder.Decode(origState.data, out, txnResp.Revision)
 			if err != nil {
 				recordDecodeError(s.groupResource, key)
@@ -480,8 +475,7 @@ func (s *store) GuaranteedUpdate(
 		return fmt.Errorf("unable to convert output object to pointer: %v", err)
 	}
 
-	skipTransformDecode := false
-	getCurrentState := s.getCurrentState(ctx, preparedKey, v, ignoreNotFound, skipTransformDecode)
+	getCurrentState := s.getCurrentState(ctx, preparedKey, v, ignoreNotFound, false)
 
 	var origState *objState
 	var origStateIsCurrent bool
@@ -607,7 +601,7 @@ func (s *store) GuaranteedUpdate(
 		span.AddEvent("Transaction committed")
 		if !txnResp.Succeeded {
 			klog.V(4).Infof("GuaranteedUpdate of %s failed because of a conflict, going to retry", preparedKey)
-			origState, err = s.getState(ctx, txnResp.KV, preparedKey, v, ignoreNotFound, skipTransformDecode)
+			origState, err = s.getState(ctx, txnResp.KV, preparedKey, v, ignoreNotFound, false)
 			if err != nil {
 				return err
 			}
@@ -678,6 +672,21 @@ func (s *store) EnableResourceSizeEstimation(getKeys storage.KeysFunc) error {
 	return nil
 }
 
+// TestOnlyResetResourceSizeEstimator clears the resource size estimator so a
+// subsequent EnableResourceSizeEstimation call succeeds.
+func TestOnlyResetResourceSizeEstimator(s storage.Interface) {
+	st, ok := s.(*store)
+	if !ok {
+		return
+	}
+	st.collectorMux.Lock()
+	defer st.collectorMux.Unlock()
+	if st.resourceSizeEstimator != nil {
+		st.resourceSizeEstimator.Close()
+		st.resourceSizeEstimator = nil
+	}
+}
+
 func (s *store) getKeys(ctx context.Context) ([]string, error) {
 	startTime := time.Now()
 	prefix, err := s.prepareKey(s.resourcePrefix, true)
@@ -702,34 +711,22 @@ func (s *store) ReadinessCheck() error {
 }
 
 func (s *store) GetCurrentResourceVersion(ctx context.Context) (uint64, error) {
-	emptyList := s.newListFunc()
-	pred := storage.SelectionPredicate{
-		Label: labels.Everything(),
-		Field: fields.Everything(),
-		Limit: 1, // just in case we actually hit something
-	}
-
-	err := s.GetList(ctx, s.resourcePrefix, storage.ListOptions{Predicate: pred}, emptyList)
-	if err != nil {
-		return 0, err
-	}
-	emptyListAccessor, err := meta.ListAccessor(emptyList)
-	if err != nil {
-		return 0, err
-	}
-	if emptyListAccessor == nil {
-		return 0, fmt.Errorf("unable to extract a list accessor from %T", emptyList)
-	}
-
-	currentResourceVersion, err := strconv.Atoi(emptyListAccessor.GetResourceVersion())
+	preparedKey, err := s.prepareKey(s.resourcePrefix, false)
 	if err != nil {
 		return 0, err
 	}
 
-	if currentResourceVersion == 0 {
+	startTime := time.Now()
+	getResp, err := s.client.Kubernetes.Get(ctx, preparedKey, kubernetes.GetOptions{})
+	metrics.RecordEtcdRequest("getCurrentResourceVersion", s.groupResource, err, startTime)
+	if err != nil {
+		return 0, err
+	}
+
+	if getResp.Revision == 0 {
 		return 0, fmt.Errorf("the current resource version must be greater than 0")
 	}
-	return uint64(currentResourceVersion), nil
+	return uint64(getResp.Revision), nil
 }
 
 // GetList implements storage.Interface.
@@ -775,7 +772,7 @@ func (s *store) GetList(ctx context.Context, key string, opts storage.ListOption
 	// get them recorded even in error cases.
 	defer func() {
 		numReturn := v.Len()
-		metrics.RecordStorageListMetrics(s.groupResource, numFetched, numEvald, numReturn)
+		metrics.RecordStorageListMetrics(s.groupResource, "", numFetched, numEvald, numReturn)
 	}()
 
 	aggregator := s.listErrAggrFactory()
@@ -810,56 +807,16 @@ func (s *store) GetList(ctx context.Context, key string, opts storage.ListOption
 			withRev = getResp.Revision
 		}
 
-		// avoid small allocations for the result slice, since this can be called in many
-		// different contexts and we don't know how significantly the result will be filtered
-		if opts.Predicate.Empty() {
-			growSlice(v, len(getResp.Kvs))
-		} else {
-			growSlice(v, 2048, len(getResp.Kvs))
+		chunkLastKey, chunkEvaluated, chunkHasMore, err := s.appendChunk(ctx, getResp.Kvs, opts.Predicate, newItemFunc, aggregator, v, paging)
+		if err != nil {
+			return err
 		}
-
-		// take items from the response until the bucket is full, filtering as we go
-		for i, kv := range getResp.Kvs {
-			if paging && int64(v.Len()) >= opts.Predicate.Limit {
-				hasMore = true
-				break
-			}
-			lastKey = kv.Key
-
-			data, _, err := s.transformer.TransformFromStorage(ctx, kv.Value, authenticatedDataString(kv.Key))
-			if err != nil {
-				if done := aggregator.Aggregate(string(kv.Key), storage.NewInternalError(fmt.Errorf("unable to transform key %q: %w", kv.Key, err))); done {
-					return aggregator.Err()
-				}
-				continue
-			}
-
-			// Check if the request has already timed out before decode object
-			select {
-			case <-ctx.Done():
-				// parent context is canceled or timed out, no point in continuing
-				return storage.NewTimeoutError(string(kv.Key), "request did not complete within requested timeout")
-			default:
-			}
-
-			obj, err := s.decoder.DecodeListItem(ctx, data, uint64(kv.ModRevision), newItemFunc)
-			if err != nil {
-				recordDecodeError(s.groupResource, string(kv.Key))
-				if done := aggregator.Aggregate(string(kv.Key), err); done {
-					return aggregator.Err()
-				}
-				continue
-			}
-
-			// being unable to set the version does not prevent the object from being extracted
-			if matched, err := opts.Predicate.Matches(obj); err == nil && matched {
-				v.Set(reflect.Append(v, reflect.ValueOf(obj).Elem()))
-			}
-
-			numEvald++
-
-			// free kv early. Long lists can take O(seconds) to decode.
-			getResp.Kvs[i] = nil
+		numEvald += chunkEvaluated
+		if chunkHasMore {
+			hasMore = true
+		}
+		if chunkLastKey != nil {
+			lastKey = chunkLastKey
 		}
 		continueKey = string(lastKey) + "\x00"
 
@@ -882,26 +839,89 @@ func (s *store) GetList(ctx context.Context, key string, opts storage.ListOption
 		}
 	}
 
-	if err := aggregator.Err(); err != nil {
-		return err
-	}
-
-	if v.IsNil() {
-		// Ensure that we never return a nil Items pointer in the result for consistency.
-		v.Set(reflect.MakeSlice(v.Type(), 0, 0))
-	}
-
 	continueValue, remainingItemCount, err := storage.PrepareContinueToken(string(lastKey), keyPrefix, withRev, getResp.Count, hasMore, opts)
 	if err != nil {
 		return err
 	}
-	if err := s.versioner.UpdateList(listObj, uint64(withRev), continueValue, remainingItemCount); err != nil {
+	return s.finalizeList(listObj, opts.Predicate, uint64(withRev), continueValue, remainingItemCount, aggregator, v)
+}
+
+func (s *store) finalizeList(listObj runtime.Object, pred storage.SelectionPredicate, rev uint64, continueValue string, remainingItemCount *int64, aggregator ListErrorAggregator, v reflect.Value) error {
+	if err := aggregator.Err(); err != nil {
+		return err
+	}
+	if v.IsNil() {
+		// Ensure that we never return a nil Items pointer in the result for consistency.
+		v.Set(reflect.MakeSlice(v.Type(), 0, 0))
+	}
+	if err := s.versioner.UpdateList(listObj, rev, continueValue, remainingItemCount); err != nil {
 		return err
 	}
 	if utilfeature.DefaultFeatureGate.Enabled(features.ShardedListAndWatch) {
-		opts.Predicate.SetShardInfoOnList(listObj)
+		pred.SetShardInfoOnList(listObj)
 	}
 	return nil
+}
+
+func (s *store) processListItem(ctx context.Context, kv *mvccpb.KeyValue, pred storage.SelectionPredicate, newItemFunc func() runtime.Object, aggregator ListErrorAggregator, v reflect.Value) (bool, error) {
+	data, _, err := s.transformer.TransformFromStorage(ctx, kv.Value, authenticatedDataString(kv.Key))
+	if err != nil {
+		if done := aggregator.Aggregate(string(kv.Key), storage.NewInternalError(fmt.Errorf("unable to transform key %q: %w", kv.Key, err))); done {
+			return false, aggregator.Err()
+		}
+		return false, nil
+	}
+
+	// Check if the request has already timed out before decode object
+	select {
+	case <-ctx.Done():
+		// parent context is canceled or timed out, no point in continuing
+		return false, storage.NewTimeoutError(string(kv.Key), "request did not complete within requested timeout")
+	default:
+	}
+
+	obj, err := s.decoder.DecodeListItem(ctx, data, uint64(kv.ModRevision), newItemFunc)
+	if err != nil {
+		recordDecodeError(s.groupResource, string(kv.Key))
+		if done := aggregator.Aggregate(string(kv.Key), err); done {
+			return false, aggregator.Err()
+		}
+		return false, nil
+	}
+
+	// being unable to set the version does not prevent the object from being extracted
+	if matched, err := pred.Matches(obj); err == nil && matched {
+		v.Set(reflect.Append(v, reflect.ValueOf(obj).Elem()))
+	}
+
+	return true, nil
+}
+
+// appendChunk appends the kvs matching pred to v.
+func (s *store) appendChunk(ctx context.Context, kvs []*mvccpb.KeyValue, pred storage.SelectionPredicate, newItemFunc func() runtime.Object, aggregator ListErrorAggregator, v reflect.Value, paging bool) (lastKey []byte, evaluated int, hasMore bool, err error) {
+	// avoid small allocations for the result slice, since this can be called in many
+	// different contexts and we don't know how significantly the result will be filtered
+	if pred.Empty() {
+		growSlice(v, len(kvs))
+	} else {
+		growSlice(v, 2048, len(kvs))
+	}
+	for i, kv := range kvs {
+		if paging && int64(v.Len()) >= pred.Limit {
+			return lastKey, evaluated, true, nil
+		}
+		lastKey = kv.Key
+		ok, err := s.processListItem(ctx, kv, pred, newItemFunc, aggregator, v)
+		if err != nil {
+			return lastKey, evaluated, false, err
+		}
+		if ok {
+			evaluated++
+		}
+		// free kv early. Long lists can take O(seconds) to decode.
+		kvs[i] = nil
+	}
+	return lastKey, evaluated, false, nil
 }
 
 func (s *store) getList(ctx context.Context, keyPrefix string, recursive bool, options kubernetes.ListOptions) (resp kubernetes.ListResponse, err error) {
@@ -988,7 +1008,7 @@ func (s *store) watchContext(ctx context.Context) context.Context {
 	return clientv3.WithRequireLeader(ctx)
 }
 
-func (s *store) getCurrentState(ctx context.Context, key string, v reflect.Value, ignoreNotFound bool, skipTransformDecode bool) func() (*objState, error) {
+func (s *store) getCurrentState(ctx context.Context, key string, v reflect.Value, ignoreNotFound bool, expectTransformOrDecodeError bool) func() (*objState, error) {
 	return func() (*objState, error) {
 		startTime := time.Now()
 		getResp, err := s.client.Kubernetes.Get(ctx, key, kubernetes.GetOptions{})
@@ -996,17 +1016,15 @@ func (s *store) getCurrentState(ctx context.Context, key string, v reflect.Value
 		if err != nil {
 			return nil, err
 		}
-		return s.getState(ctx, getResp.KV, key, v, ignoreNotFound, skipTransformDecode)
+		return s.getState(ctx, getResp.KV, key, v, ignoreNotFound, expectTransformOrDecodeError)
 	}
 }
 
-// getState constructs a new objState from the given response from the storage.
-// skipTransformDecode: if true, the function will neither transform the data
-// from the storage nor decode it into an object; otherwise, data from the
-// storage will be transformed and decoded.
-// NOTE: when skipTransformDecode is true, the 'data', and the 'obj' fields
-// of the objState will be nil, and 'stale' will be set to true.
-func (s *store) getState(ctx context.Context, kv *mvccpb.KeyValue, key string, v reflect.Value, ignoreNotFound bool, skipTransformDecode bool) (*objState, error) {
+// getState constructs a new objState from the given response from the storage. If
+// expectTransformOrDecodeError is true and neither transformation nor decode fails, returns an
+// InvalidObj error; if either fails, the returned error and the 'obj' field of the returned
+// objState will both be nil.
+func (s *store) getState(ctx context.Context, kv *mvccpb.KeyValue, key string, v reflect.Value, ignoreNotFound bool, expectTransformOrDecodeError bool) (*objState, error) {
 	state := &objState{
 		meta: &storage.ResponseMeta{},
 	}
@@ -1024,30 +1042,42 @@ func (s *store) getState(ctx context.Context, kv *mvccpb.KeyValue, key string, v
 		if err := runtime.SetZeroValue(state.obj); err != nil {
 			return nil, err
 		}
-	} else {
-		state.rev = kv.ModRevision
-		state.meta.ResourceVersion = uint64(state.rev)
+		return state, nil
+	}
 
-		if skipTransformDecode {
-			// be explicit that we don't have the object
-			state.obj = nil
-			state.stale = true // this seems a more sane value here
-			return state, nil
-		}
+	state.rev = kv.ModRevision
+	state.meta.ResourceVersion = uint64(state.rev)
 
-		data, stale, err := s.transformer.TransformFromStorage(ctx, kv.Value, authenticatedDataString(key))
-		if err != nil {
+	data, stale, err := s.transformer.TransformFromStorage(ctx, kv.Value, authenticatedDataString(key))
+	if err != nil {
+		if !expectTransformOrDecodeError {
 			return nil, storage.NewInternalError(err)
 		}
 
-		state.data = data
-		state.stale = stale
+		// be explicit that we don't have the object
+		state.obj = nil
+		state.stale = true // this seems a more sane value here
+		return state, nil
+	}
 
-		if err := s.decoder.Decode(state.data, state.obj, state.rev); err != nil {
+	state.data = data
+	state.stale = stale
+
+	if err := s.decoder.Decode(state.data, state.obj, state.rev); err != nil {
+		if !expectTransformOrDecodeError {
 			recordDecodeError(s.groupResource, key)
 			return nil, err
 		}
+
+		// be explicit that we don't have the object
+		state.obj = nil
+		return state, nil
 	}
+
+	if expectTransformOrDecodeError {
+		return nil, storage.NewInvalidObjError(key, "unsafe deletion is not allowed because the object is decodable from storage")
+	}
+
 	return state, nil
 }
 
